@@ -1,4 +1,3 @@
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -37,6 +36,26 @@ rules:
   resources:
   - services
   verbs:
+    - get
+    - list
+    - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+    - get
+    - list
+    - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch

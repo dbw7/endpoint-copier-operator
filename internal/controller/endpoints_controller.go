@@ -18,10 +18,12 @@ package controller
 
 import (
 	"context"
-
+	"fmt"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"strings"
 )
 
 var (
@@ -149,9 +152,130 @@ func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Log
 		managedEndpoints.Subsets = append(managedEndpoints.Subsets, newSubset)
 	}
 
-	// Update the custom Endpoints resource with the updated IP addresses.
 	if err := r.Update(ctx, managedEndpoints); err != nil {
+		if apierrors.IsNotFound(err) {
+			if err := r.Create(ctx, managedEndpoints); err != nil {
+				logger.Error(err, "error creating endpoints")
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	if len(managedService.Spec.IPFamilies) <= 1 {
+		return nil // Not dual-stack, we're done
+	}
+
+	secondaryIPFamily := managedService.Spec.IPFamilies[1]
+	if err := r.handleSecondaryEndpoints(ctx, logger, managedService, secondaryIPFamily); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// The primary IP family endpoints are automatically handled with the previous function
+// but the secondary IP family endpoints must be configured
+func (r *EndpointsReconciler) handleSecondaryEndpoints(ctx context.Context, logger logr.Logger,
+	managedService *corev1.Service, ipFamily corev1.IPFamily) error {
+
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList, client.MatchingLabels{"node-role.kubernetes.io/control-plane": "true"}); err != nil {
+		logger.Error(err, "error listing control plane nodes")
+		return err
+	}
+
+	var addressType discoveryv1.AddressType
+	var familyName string
+
+	if ipFamily == corev1.IPv6Protocol {
+		addressType = discoveryv1.AddressTypeIPv6
+		familyName = "ipv6"
+	} else {
+		addressType = discoveryv1.AddressTypeIPv4
+		familyName = "ipv4"
+	}
+
+	endpointSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%s", r.ManagedEndpointName, familyName),
+			Namespace: r.ManagedEndpointNamespace,
+			Labels: map[string]string{
+				"kubernetes.io/service-name":             r.ManagedEndpointName,
+				"endpointslice.kubernetes.io/managed-by": Name,
+			},
+		},
+		AddressType: addressType,
+		Ports:       []discoveryv1.EndpointPort{},
+		Endpoints:   []discoveryv1.Endpoint{},
+	}
+
+	for _, port := range managedService.Spec.Ports {
+		portNum := int32(port.Port)
+		portProto := port.Protocol
+		portName := port.Name
+		endpointSlice.Ports = append(endpointSlice.Ports, discoveryv1.EndpointPort{
+			Name:     &portName,
+			Port:     &portNum,
+			Protocol: &portProto,
+		})
+	}
+
+	for _, node := range nodeList.Items {
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				isIPv6 := strings.Contains(addr.Address, ":")
+				if (ipFamily == corev1.IPv6Protocol && isIPv6) ||
+					(ipFamily == corev1.IPv4Protocol && !isIPv6) {
+
+					ready := true
+					nodeName := node.Name
+					endpointSlice.Endpoints = append(endpointSlice.Endpoints, discoveryv1.Endpoint{
+						Addresses: []string{addr.Address},
+						Conditions: discoveryv1.EndpointConditions{
+							Ready: &ready,
+						},
+						NodeName: &nodeName,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	existingSlice := &discoveryv1.EndpointSlice{}
+	err := r.Get(ctx, client.ObjectKey{
+		Namespace: r.ManagedEndpointNamespace,
+		Name:      endpointSlice.Name,
+	}, existingSlice)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if err := r.Create(ctx, endpointSlice); err != nil {
+				logger.Error(err, "error creating EndpointSlice",
+					"name", endpointSlice.Name,
+					"addressType", addressType)
+				return err
+			}
+			logger.Info("Created EndpointSlice",
+				"name", endpointSlice.Name,
+				"addressType", addressType)
+		} else {
+			logger.Error(err, "error getting EndpointSlice")
+			return err
+		}
+	} else {
+		existingSlice.Ports = endpointSlice.Ports
+		existingSlice.Endpoints = endpointSlice.Endpoints
+
+		if err := r.Update(ctx, existingSlice); err != nil {
+			logger.Error(err, "error updating EndpointSlice")
+			return err
+		}
+		logger.Info("Updated EndpointSlice",
+			"name", existingSlice.Name,
+			"addressType", addressType)
 	}
 
 	return nil

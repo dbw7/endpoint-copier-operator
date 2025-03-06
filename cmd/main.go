@@ -19,6 +19,7 @@ package main
 import (
 	"flag"
 	"github/endpoint-copier-operator/internal/controller"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -44,6 +45,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(discoveryv1.AddToScheme(scheme))
 
 	//+kubebuilder:scaffold:scheme
 }
